@@ -1,223 +1,236 @@
-import { computeBeforeAfter } from "./model.js";
-import { fmtRub, fmtSignedRub, num, int, clamp, setText, getEl } from "./utils.js";
-
-const els = {
-  regime: getEl("regime"),
-  turnover: getEl("turnover"),
-  acquiring: getEl("acquiring"),
-
-  hasEmployees: getEl("hasEmployees"),
-  empCount: getEl("empCount"),
-  empSalary: getEl("empSalary"),
-  empContribSum: getEl("empContribSum"),
-  fixedContrib: getEl("fixedContrib"),
-
-  splitMaster: getEl("splitMaster"),
-  splitSalon: getEl("splitSalon"),
-
-  patentFee: getEl("patentFee"),
-  extra: getEl("extra"),
-  extra15: getEl("extra15"),
-
-  empContribWrap: getEl("empContribWrap"),
-  extra15Wrap: getEl("extra15Wrap"),
-  extraLabel: getEl("extraLabel"),
-
-  osnVat: getEl("osnVat"),
-  osnTypeWrap: getEl("osnTypeWrap"),
-  osnType: getEl("osnType"),
-
-  includeOnePct: getEl("includeOnePct"),
-
-  contribBefore: getEl("contribBefore"),
-  loadBefore: getEl("loadBefore"),
-  contribAfter: getEl("contribAfter"),
-  loadAfter: getEl("loadAfter"),
-
-  revBefore: getEl("revBefore"),
-  taxBefore: getEl("taxBefore"),
-  payMasterBefore: getEl("payMasterBefore"),
-  acqBefore: getEl("acqBefore"),
-  expBefore: getEl("expBefore"),
-  netBefore: getEl("netBefore"),
-
-  revAfter: getEl("revAfter"),
-  taxAfter: getEl("taxAfter"),
-  netAfter: getEl("netAfter"),
-
-  diffTax: getEl("diffTax"),
-  diffNet: getEl("diffNet"),
-  diffBox: getEl("diffBox"),
-
-  // mixed режим
-  mixedIncomeWrap: getEl("mixedIncomeWrap"),
-  incomePatent: getEl("incomePatent"),
-  incomeUsn: getEl("incomeUsn"),
-  mixedAfterFromSalonIncome: getEl("mixedAfterFromSalonIncome"),
-};
-
-function getOsnRate(osnType) {
-  if (osnType === "ip13") return 0.13;
-  if (osnType === "ip15") return 0.15;
-  return 0.2;
-}
-
-function togglePatent() {
-  if (!els.patentFee) return;
-  const r = els.regime?.value;
-  const needPatentFee = (r === "patent" || r === "patent_usn6");
-  els.patentFee.disabled = !needPatentFee;
-  if (!needPatentFee) els.patentFee.value = 0;
-}
-
-function toggleModeUI() {
-  const regime = els.regime?.value || "usn6";
-  const isUsn15 = regime === "usn15";
-  const isOsn = regime === "osn";
-  const isMixed = regime === "patent_usn6";
-
-  if (els.empContribWrap) els.empContribWrap.classList.toggle("hidden", !isUsn15);
-  if (els.extra15Wrap) els.extra15Wrap.classList.toggle("hidden", !isUsn15);
-  if (els.extraLabel) els.extraLabel.classList.toggle("hidden", !!isUsn15);
-  if (els.osnTypeWrap) els.osnTypeWrap.classList.toggle("hidden", !isOsn);
-
-  if (els.mixedIncomeWrap) els.mixedIncomeWrap.classList.toggle("hidden", !isMixed);
-
-  // Для mixed: turnover считаем автоматически
-  if (els.turnover) {
-    els.turnover.readOnly = isMixed;
-  }
-}
+import { calcTax, calcOnePctContrib } from "./tax.js";
+import { clamp, num } from "./utils.js";
 
 /**
- * Сплиты: меняем один -> второй = 100 - первый
+ * Главная модель расчёта «до» и «после» внедрения.
+ *
+ * КЛЮЧЕВАЯ ЛОГИКА (по таблице):
+ * - Фикс.взносы ИП участвуют в вычете УСН, но НЕ вычитаются из чистой прибыли.
+ * - «После»: сотрудников нет (мастера — самозанятые), вычет взносов 100%.
+ * - «После»: вместо эквайринга — комиссия платформы (Мозен).
+ * - 1% взнос и страх.взносы за сотрудников вычитаются из чистой прибыли.
  */
-function syncSplits() {
-  if (!els.splitMaster || !els.splitSalon) return;
+export function computeBeforeAfter(input) {
+  const regime = input.regime;
 
-  const masterRaw = clamp(num(els.splitMaster.value, 0), 0, 100);
-  const salonRaw = clamp(num(els.splitSalon.value, 0), 0, 100);
+  const turnover = Math.max(0, num(input.turnover, 0));
+  const acquiringRate = Math.max(0, num(input.acquiringRate, 0));
 
-  if (document.activeElement === els.splitMaster) {
-    els.splitSalon.value = clamp(100 - masterRaw, 0, 100);
-  } else if (document.activeElement === els.splitSalon) {
-    els.splitMaster.value = clamp(100 - salonRaw, 0, 100);
+  const hasEmployees = !!input.hasEmployees;
+  const empCount = hasEmployees ? Math.max(0, Math.round(num(input.empCount, 0))) : 0;
+  const empSalary = hasEmployees ? Math.max(0, num(input.empSalary, 0)) : 0;
+
+  const fixedContrib = Math.max(0, num(input.fixedContrib, 0));
+  const includeOnePct = !!input.includeOnePct;
+
+  const splitMaster = clamp(num(input.splitMaster, 0), 0, 100);
+  const finalSplitSalon = clamp(100 - splitMaster, 0, 100);
+
+  const patentFee = Math.max(0, num(input.patentFee, 0));
+  const extraCommon = Math.max(0, num(input.extra, 0));
+  const extraUsn15 = Math.max(0, num(input.extra15, 0));
+  const extra = regime === "usn15" ? extraUsn15 : extraCommon;
+
+  const includeVat = !!input.includeVat || regime === "osn";
+  const osnRate = num(input.osnRate, 0.2);
+  const osnType = input.osnType || "ooo20";
+  const isOsnIP = regime === "osn" && (osnType === "ip13" || osnType === "ip15");
+
+  // Новые поля
+  const platformFeeRate = Math.max(0, num(input.platformFeeRate, 0));
+  const cashWithdrawal = Math.max(0, num(input.cashWithdrawal, 0));
+
+  const acqCost = turnover * (acquiringRate / 100);
+  const payToMaster = turnover * (splitMaster / 100);
+
+  // Страх.взносы за сотрудников (только «до»)
+  const empContrib = hasEmployees
+    ? (regime === "usn15"
+        ? Math.max(0, num(input.empContribSum, 0))
+        : empCount * empSalary * 0.30)
+    : 0;
+
+  // Нужны ли фикс.взносы ИП для данного режима
+  function needsFixedContrib() {
+    return regime === "usn6" || regime === "usn15" || regime === "patent" || isOsnIP;
   }
 
-  const finalMaster = clamp(num(els.splitMaster.value, 0), 0, 100);
-  els.splitSalon.value = clamp(100 - finalMaster, 0, 100);
-}
-
-function getTurnover(regime) {
-  if (regime !== "patent_usn6") {
-    return Math.max(0, num(els.turnover?.value, 0));
+  function onePctFor(rev) {
+    if (!includeOnePct) return 0;
+    if (regime === "osn" && !isOsnIP) return 0;
+    return calcOnePctContrib(rev);
   }
-  const p = Math.max(0, num(els.incomePatent?.value, 0));
-  const u = Math.max(0, num(els.incomeUsn?.value, 0));
-  const sum = p + u;
-  if (els.turnover) els.turnover.value = String(sum);
-  return sum;
-}
-
-function run() {
-  syncSplits();
-
-  const regime = els.regime?.value || "usn6";
-  const turnover = getTurnover(regime);
-
-  const acquiringRate = Math.max(0, num(els.acquiring?.value, 0));
-
-  const hasEmployees = !!els.hasEmployees?.checked;
-  const empCount = hasEmployees ? Math.max(0, int(els.empCount?.value, 0)) : 0;
-  const empSalary = hasEmployees ? Math.max(0, num(els.empSalary?.value, 0)) : 0;
-
-  const fixedContrib = Math.max(0, num(els.fixedContrib?.value, 0));
-
-  const splitMaster = clamp(num(els.splitMaster?.value, 0), 0, 100);
-  const splitSalon = clamp(num(els.splitSalon?.value, 0), 0, 100);
-
-  const patentFee = Math.max(0, num(els.patentFee?.value, 0));
-
-  const extra = Math.max(0, num(els.extra?.value, 0));
-  const extra15 = Math.max(0, num(els.extra15?.value, 0));
-  const empContribSum = Math.max(0, num(els.empContribSum?.value, 0));
-
-  const includeVat = !!els.osnVat?.checked || regime === "osn";
-  const osnRate = getOsnRate(els.osnType?.value);
-
-  const includeOnePct = !!els.includeOnePct?.checked;
 
   // mixed inputs
-  const incomePatent = Math.max(0, num(els.incomePatent?.value, 0));
-  const incomeUsn = Math.max(0, num(els.incomeUsn?.value, 0));
-  const mixedAfterFromSalonIncome = !!els.mixedAfterFromSalonIncome?.checked;
+  const incomePatent = Math.max(0, num(input.incomePatent, 0));
+  const incomeUsn = Math.max(0, num(input.incomeUsn, 0));
+  const mixedAfterFromSalonIncome = !!input.mixedAfterFromSalonIncome;
 
-  const result = computeBeforeAfter({
-    regime,
-    turnover,
-    acquiringRate,
-    hasEmployees,
-    empCount,
-    empSalary,
-    empContribSum,
-    fixedContrib,
-    splitMaster,
-    splitSalon,
-    patentFee,
-    extra,
-    extra15,
-    includeVat,
-    osnRate,
-    osnType: els.osnType?.value || "ooo20",
-    includeOnePct,
-    incomePatent,
-    incomeUsn,
-    mixedAfterFromSalonIncome,
-  });
+  function calcMixedTax({ allowDeduction, hasEmp, incomeUsnForTax, revenueForOnePct, empContribLocal }) {
+    const onePct = onePctFor(revenueForOnePct);
+    const contribAll = fixedContrib + onePct + empContribLocal;
 
-  setText(els.revBefore, fmtRub(result.before.revenue));
-  setText(els.payMasterBefore, fmtRub(result.before.payMaster));
-  setText(els.acqBefore, fmtRub(result.before.acquiring));
-  setText(els.taxBefore, fmtRub(result.before.tax));
-  setText(els.expBefore, fmtRub(result.before.extra));
-  setText(els.netBefore, fmtRub(result.before.net));
+    const patentObj = calcTax({
+      regime: "patent",
+      revenue: 0,
+      profit: 0,
+      patentFee,
+      includeVat: false,
+      contribAll,
+      hasEmployees: hasEmp,
+      allowDeduction,
+      osnRate: 0.2,
+    });
 
-  setText(els.revAfter, fmtRub(result.after.revenue));
-  setText(els.taxAfter, fmtRub(result.after.tax));
-  setText(els.netAfter, fmtRub(result.after.net));
+    const usedForPatent = patentObj.deduction || 0;
+    const remainingContrib = Math.max(0, contribAll - usedForPatent);
 
-  setText(els.contribBefore, fmtRub(result.before.contribTotal));
-  setText(els.loadBefore, fmtRub(result.before.load));
-  setText(els.contribAfter, fmtRub(result.after.contribTotal));
-  setText(els.loadAfter, fmtRub(result.after.load));
+    const usnObj = calcTax({
+      regime: "usn6",
+      revenue: incomeUsnForTax,
+      profit: 0,
+      patentFee: 0,
+      includeVat: false,
+      contribAll: remainingContrib,
+      hasEmployees: hasEmp,
+      allowDeduction,
+      osnRate: 0.2,
+    });
 
-  setText(els.diffTax, fmtSignedRub(result.diff.tax));
-  setText(els.diffNet, fmtSignedRub(result.diff.net));
+    return {
+      tax: patentObj.tax + usnObj.tax,
+      onePct,
+      empContrib: empContribLocal,
+    };
+  }
 
-  if (els.diffBox) els.diffBox.classList.toggle("danger", result.diff.net < 0);
+  // ===== ДО ВНЕДРЕНИЯ =====
+  let taxBefore = 0;
+  let onePctBefore = 0;
+  let empContribBefore = empContrib;
+
+  if (regime === "patent_usn6") {
+    const m = calcMixedTax({
+      allowDeduction: true,
+      hasEmp: hasEmployees,
+      incomeUsnForTax: incomeUsn,
+      revenueForOnePct: turnover,
+      empContribLocal: empContrib,
+    });
+    taxBefore = m.tax;
+    onePctBefore = m.onePct;
+  } else {
+    onePctBefore = onePctFor(turnover);
+    const contribAllBefore = (needsFixedContrib() ? fixedContrib : 0) + onePctBefore + empContrib;
+
+    let profitBefore = 0;
+    if (regime === "usn15") {
+      profitBefore = turnover - (extraUsn15 + contribAllBefore + payToMaster + acqCost);
+    } else if (regime === "osn") {
+      const revExVat = includeVat ? turnover * 100 / 120 : turnover;
+      profitBefore = revExVat - payToMaster - extraCommon - acqCost - contribAllBefore;
+    } else {
+      profitBefore = turnover - payToMaster - extra - acqCost;
+    }
+
+    const taxObj = calcTax({
+      regime,
+      revenue: turnover,
+      profit: profitBefore,
+      patentFee,
+      includeVat,
+      contribAll: contribAllBefore,
+      hasEmployees,
+      allowDeduction: true,
+      osnRate,
+    });
+    taxBefore = taxObj.tax;
+  }
+
+  // Чисто салона «до»:
+  // turnover - мастерам - эквайринг - наличка - УСН - 1%взнос - страх.сотр - доп.расходы
+  // Фикс.взносы НЕ вычитаются (они «вернулись» через вычет)
+  const netBefore = turnover - payToMaster - acqCost - cashWithdrawal - taxBefore - onePctBefore - empContribBefore - extra;
+
+  // ===== ПОСЛЕ ВНЕДРЕНИЯ =====
+  const rentIncome = turnover * (finalSplitSalon / 100);
+  const platformFee = turnover * (platformFeeRate / 100);
+
+  let taxAfter = 0;
+  let onePctAfter = 0;
+
+  // После внедрения: сотрудников НЕТ, мастера — самозанятые
+  if (regime === "patent_usn6") {
+    let incomeUsnAfter = incomeUsn;
+    let revForOnePct = turnover;
+    if (mixedAfterFromSalonIncome) {
+      const factor = turnover > 0 ? (rentIncome / turnover) : 0;
+      incomeUsnAfter = incomeUsn * factor;
+      revForOnePct = rentIncome;
+    }
+    const m = calcMixedTax({
+      allowDeduction: true,
+      hasEmp: false,
+      incomeUsnForTax: incomeUsnAfter,
+      revenueForOnePct: revForOnePct,
+      empContribLocal: 0,
+    });
+    taxAfter = m.tax;
+    onePctAfter = m.onePct;
+  } else {
+    onePctAfter = onePctFor(rentIncome);
+    const contribAllAfter = (needsFixedContrib() ? fixedContrib : 0) + onePctAfter;
+
+    let profitAfter = 0;
+    if (regime === "usn15") {
+      profitAfter = rentIncome - (extraUsn15 + contribAllAfter);
+    } else if (regime === "osn") {
+      const revExVat = includeVat ? rentIncome * 100 / 120 : rentIncome;
+      profitAfter = revExVat - extraCommon - contribAllAfter;
+    } else {
+      profitAfter = rentIncome;
+    }
+
+    const taxObj = calcTax({
+      regime,
+      revenue: rentIncome,
+      profit: profitAfter,
+      patentFee,
+      includeVat,
+      contribAll: contribAllAfter,
+      hasEmployees: false, // после внедрения сотрудников нет
+      allowDeduction: true,
+      osnRate,
+    });
+    taxAfter = taxObj.tax;
+  }
+
+  // Чисто салона «после»:
+  // доход салона - комиссия платформы - УСН - 1%взнос
+  const netAfter = rentIncome - platformFee - taxAfter - onePctAfter;
+
+  return {
+    before: {
+      revenue: turnover,
+      payMaster: payToMaster,
+      acquiring: acqCost,
+      cashWithdrawal,
+      tax: taxBefore,
+      onePct: onePctBefore,
+      empContrib: empContribBefore,
+      extra,
+      net: netBefore,
+    },
+    after: {
+      revenue: rentIncome,
+      platformFee,
+      tax: taxAfter,
+      onePct: onePctAfter,
+      net: netAfter,
+    },
+    diff: {
+      tax: (taxAfter + onePctAfter) - (taxBefore + onePctBefore + empContribBefore),
+      net: netAfter - netBefore,
+    },
+  };
 }
-
-// listeners
-const ids = [
-  "regime", "turnover", "acquiring", "fixedContrib", "empContribSum", "hasEmployees",
-  "empCount", "empSalary", "patentFee", "extra", "extra15", "osnVat", "osnType",
-  "splitMaster", "splitSalon", "includeOnePct",
-  "incomePatent", "incomeUsn", "mixedAfterFromSalonIncome"
-];
-
-ids.forEach((id) => {
-  const el = getEl(id);
-  if (!el) return;
-  el.addEventListener("input", run);
-  el.addEventListener("change", run);
-});
-
-if (els.regime) {
-  els.regime.addEventListener("change", togglePatent);
-  els.regime.addEventListener("change", toggleModeUI);
-  els.regime.addEventListener("change", run);
-}
-
-togglePatent();
-toggleModeUI();
-run();
